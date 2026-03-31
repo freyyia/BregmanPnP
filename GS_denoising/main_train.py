@@ -1,3 +1,5 @@
+import sys
+
 import pytorch_lightning as pl
 from lightning_denoiser import GradMatch
 from data_module import DataModule
@@ -34,7 +36,10 @@ if __name__ == "__main__":
     log_path = hparams.log_folder + "/" + hparams.name
     if not os.path.exists(log_path):
         os.mkdir(log_path)
-    tb_logger = pl_loggers.TensorBoardLogger(log_path)
+    # Attention: changed the logger from Tensorboard to Wandb
+    #tb_logger = pl_loggers.TensorBoardLogger(log_path)
+    from lightning.pytorch.loggers import WandbLogger
+    tb_logger = WandbLogger(entity="bloom", project="BDRUNET", save_dir=log_path)
 
     model = GradMatch(hparams)
     dm = DataModule(hparams)
@@ -57,7 +62,8 @@ if __name__ == "__main__":
 
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
-    max_epochs = 1200
+    #attention: changed max_epochs
+    max_epochs = 200 #1200
 
     if hparams.resume_from_checkpoint:
         trainer = pl.Trainer(

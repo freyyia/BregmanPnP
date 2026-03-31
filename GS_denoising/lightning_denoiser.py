@@ -106,7 +106,12 @@ class GradMatch(pl.LightningModule):
 
     def __init__(self, hparams):
         super().__init__()
-        self.validation_step_outputs = []
+        #self.validation_step_outputs = []
+        self.validation_step_outputs_res_mean_SN = []
+        self.validation_step_outputs_res_max_SN = []
+        self.validation_step_outputs_res_psnr = []
+        self.validation_step_outputs_res_Dg = []
+
         self.save_hyperparameters(hparams)
         self.student_grad = StudentGrad(
             self.hparams.model_name,
@@ -242,21 +247,40 @@ class GradMatch(pl.LightningModule):
         loss = self.lossfn(x_hat, y)
         train_PSNR = psnr(x_hat, y)
 
+        ### insert
+        if self.hparams.jacobian_loss_weight > 0:
+            jacobian_norm = self.jacobian_spectral_norm(x, x_hat, sigma_model, interpolation=False, training=True)
+            self.log('train/jacobian_norm_max', jacobian_norm.max(), on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log('train/jacobian_norm_mean', jacobian_norm.mean(), on_epoch=True, sync_dist=True)
+            if self.hparams.jacobian_loss_type == 'max':
+                jacobian_loss = torch.maximum(jacobian_norm, torch.ones_like(jacobian_norm)-self.hparams.eps_jacobian_loss)
+            elif self.hparams.jacobian_loss_type == 'exp':
+                jacobian_loss = self.hparams.eps_jacobian_loss * torch.exp(jacobian_norm - torch.ones_like(jacobian_norm)*(1+self.hparams.eps_jacobian_loss))  / self.hparams.eps_jacobian_loss
+            else :
+                print("jacobian loss not available")
+            jacobian_loss = torch.clip(jacobian_loss, 0, 1e3)
+            self.log('train/jacobian_loss_max', jacobian_loss.max(), on_epoch=True, prog_bar=True, sync_dist=True)
+
+            loss = (loss + self.hparams.jacobian_loss_weight * jacobian_loss)
+
+
+        ### insert end
+
         loss = loss.mean()
 
-        self.log("train/train_loss", loss.detach(), on_epoch=True)
-        self.log("train/train_psnr", train_PSNR.detach(), prog_bar=True, on_epoch=True)
+        self.log("train/train_loss", loss.detach(), on_epoch=True, sync_dist=True)
+        self.log("train/train_psnr", train_PSNR.detach(), prog_bar=True, on_epoch=True, sync_dist=True)
 
         if batch_idx == 0:
             noisy_grid = torchvision.utils.make_grid(normalize_min_max(x.detach())[:1])
             denoised_grid = torchvision.utils.make_grid(
                 normalize_min_max(x_hat.detach())[:1]
             )
-            self.logger.experiment.add_image(
-                "train/noisy", noisy_grid, self.current_epoch
+            self.logger.log_image(
+                "train/noisy", [noisy_grid], self.current_epoch
             )
-            self.logger.experiment.add_image(
-                "train/denoised", denoised_grid, self.current_epoch
+            self.logger.log_image(
+                "train/denoised", [denoised_grid], self.current_epoch
             )
 
         return loss
@@ -270,7 +294,7 @@ class GradMatch(pl.LightningModule):
         y, _ = batch
         gamma_list = self.hparams.gamma_list_test
         for i, gamma in enumerate(gamma_list):
-            y = torch.clamp(y, 0.001, y.max())
+            y = torch.clamp(y, 0.001, None)
             if not self.hparams.constant_noise_map:
                 sigma_model = y * (gamma / (gamma - 2)) * np.sqrt(1 / (gamma - 3))
             else:
@@ -289,6 +313,7 @@ class GradMatch(pl.LightningModule):
                     current_model = lambda v: self.forward(v, sigma_model)
                     x_hat, Dg, g = current_model(x_hat)
                 l = self.lossfn(x_hat, y).mean()
+                self.validation_step_outputs_res_psnr.append(psnr(x_hat, y))
                 p = psnr(x_hat, y).mean()
                 Dg_norm = torch.norm(Dg, p=2)
             else:
@@ -305,6 +330,15 @@ class GradMatch(pl.LightningModule):
                 l = self.lossfn(x_hat, y)
                 p = psnr(x_hat, y)
 
+            self.validation_step_outputs_res_Dg.append(Dg_norm)
+
+            #FIXME
+            #if self.hparams.get_spectral_norm:
+            #    jacobian_norm = self.jacobian_spectral_norm_validation(y, x_hat, sigma_model)
+            #    self.validation_step_outputs_res_max_SN.append(jacobian_norm.max().detach())
+            #    self.validation_step_outputs_res_mean_SN.append(jacobian_norm.mean().detach())
+
+
             if self.hparams.test_convexity:
                 min_convexity_gap, mean_convexity_gap = self.test_convexity(
                     y,
@@ -315,14 +349,16 @@ class GradMatch(pl.LightningModule):
                 self.log(
                     "min_convexity_gap_" + str(gamma),
                     min_convexity_gap,
-                    reduce_fx=torch.min,
+                    reduce_fx=torch.min, 
+                    sync_dist=True
                 )
-                self.log("mean_convexity_gap_" + str(gamma), mean_convexity_gap)
+                self.log("mean_convexity_gap_" + str(gamma), mean_convexity_gap, sync_dist=True)
 
-            self.log("psnr_" + str(gamma), p.detach())
-            self.log("loss_" + str(gamma), l.detach())
-            self.log("g_" + str(gamma), g.detach())
-            self.log("Dg_norm_" + str(gamma), Dg_norm.detach())
+            self.log("psnr_" + str(gamma), p.detach(), sync_dist=True)
+            self.log("val/avg_psnr", p.detach(), sync_dist=True)
+            self.log("loss_" + str(gamma), l.detach(), sync_dist=True)
+            self.log("g_" + str(gamma), g.detach(), sync_dist=True)
+            self.log("Dg_norm_" + str(gamma), Dg_norm.detach(), sync_dist=True)
 
             if self.hparams.save_images:
                 print("psnr noisy", gamma, psnr(x, y))
@@ -372,18 +408,35 @@ class GradMatch(pl.LightningModule):
             denoised_grid = torchvision.utils.make_grid(
                 normalize_min_max(x_hat.detach())[:1]
             )
-            self.logger.experiment.add_image(
-                "val/clean", clean_grid, self.current_epoch
+            self.logger.log_image(
+                "val/clean", [clean_grid], self.current_epoch
             )
-            self.logger.experiment.add_image(
-                "val/noisy", noisy_grid, self.current_epoch
+            self.logger.log_image(
+                "val/noisy", [noisy_grid], self.current_epoch
             )
-            self.logger.experiment.add_image(
-                "val/denoised", denoised_grid, self.current_epoch
+            self.logger.log_image(
+                "val/denoised", [denoised_grid], self.current_epoch
             )
+
+    def on_validation_epoch_end(self):
+        epoch_average_psnr = torch.stack(self.validation_step_outputs_res_psnr).mean()
+        self.log("validation_epoch_average_psnr", epoch_average_psnr, sync_dist=True)
+        epoch_average_Dg_norm = torch.stack(self.validation_step_outputs_res_Dg).mean()
+        self.log("validation_epoch_average_Dg_norm", epoch_average_Dg_norm, sync_dist=True)
+        #FIXME
+        #epoch_average_max_SN = torch.stack(self.validation_step_outputs_res_max_SN).mean()
+        #self.log("validation_epoch_max_SN", epoch_average_max_SN, sync_dist=True)
+        #epoch_average_mean_SN = torch.stack(self.validation_step_outputs_res_mean_SN).mean()
+        #self.log("validation_epoch_mean_SN", epoch_average_mean_SN, sync_dist=True)        
+        
+        self.validation_step_outputs_res_psnr.clear()  # free memory
+        self.validation_step_outputs_res_Dg.clear()  # free memory
+        #self.validation_step_outputs_res_max_SN.clear()  # free memory
+        #self.validation_step_outputs_res_mean_SN.clear()  # free memory
 
     def test_step(self, batch, batch_idx):
         return self.validation_step(batch, batch_idx)
+
 
     def configure_optimizers(self):
         optim_params = []
@@ -462,6 +515,86 @@ class GradMatch(pl.LightningModule):
                     )
             return min_error, mean_error
 
+    #  following two methods
+    #  added to enable spectral norm computation to the Bregman Network
+    #  copied from Prox_GSPnP
+        
+    def power_iteration(self, operator, vector_size, steps=100, momentum=0.0, eps= 1e-3,
+                    init_vec=None, verbose=False):
+        '''
+        Power iteration algorithm for spectral norm calculation
+        '''
+        with torch.no_grad():
+            if init_vec is None:
+                vec = torch.rand(vector_size).to(self.device)
+            else:
+                vec = init_vec.to(self.device)
+            vec /= torch.norm(vec.view(vector_size[0], -1), dim=1, p=2).view(vector_size[0], 1, 1, 1)
+
+            for i in range(steps):
+
+                new_vec = operator(vec)
+                new_vec = new_vec / torch.norm(new_vec.view(vector_size[0], -1), dim=1, p=2).view(vector_size[0], 1, 1, 1)
+                if momentum>0 and i > 1:
+                    new_vec -= momentum * old_vec
+                old_vec = vec
+                vec = new_vec
+                diff_vec = torch.norm(new_vec - old_vec,p=2)
+                if diff_vec < eps:
+                    if verbose:
+                        print("Power iteration converged at iteration: ", i)
+                    break
+
+        new_vec = operator(vec)
+        div = torch.norm(vec.view(vector_size[0], -1), dim=1, p=2).view(vector_size[0])
+        lambda_estimate = torch.abs(
+                torch.sum(vec.view(vector_size[0], -1) * new_vec.view(vector_size[0], -1), dim=1)) / div
+
+        return lambda_estimate
+
+
+
+    def jacobian_spectral_norm(self, y, x_hat, sigma, interpolation=False, training=False):
+        '''
+        Get spectral norm of Dg^2 the hessian of g
+        :param y:
+        :param x_hat: (unused if interpolation=False)
+        :param sigma: (1/gamma)
+        :param interpolation:
+        :return lambda_estimate:
+        '''
+        #import seaborn_image as isns
+        #import utils.utils_restoration as ur
+        torch.set_grad_enabled(True)
+        if interpolation:
+            eta = torch.rand(y.size(0), 1, 1, 1, requires_grad=True).to(self.device)
+            x = eta * y.detach() + (1 - eta) * x_hat.detach()
+            x = x.to(self.device)
+        else:
+            x = y
+
+        x.requires_grad_()
+        x_hat, Dg, _ = self.forward(x, sigma)
+        #ax = isns.imgplot(ur.tensor2array(x_hat.cpu()))
+        #plt.show()
+
+
+        #if self.hparams.grad_matching:
+        #    # we calculate the lipschitz constant of the gradient operator Dg=Id-D
+        #    operator = lambda vec: torch.autograd.grad(Dg, x, grad_outputs=vec, create_graph=True, retain_graph=True, only_inputs=True)[0]
+        if self.hparams.grad_matching_bregman:
+            # we calculate the lipschitz constant of the gradient operator Dg=Id-D
+            operator = lambda vec: x **2 * torch.autograd.grad(Dg, x, grad_outputs=vec, create_graph=True, retain_graph=True, only_inputs=True)[0]
+        else :
+            # we calculate the lipschitz constant of the denoiser operator D
+            f = x_hat
+            operator = lambda vec: torch.autograd.grad(f, x, grad_outputs=vec, create_graph=True, retain_graph=True, only_inputs=True)[0]
+        lambda_estimate = self.power_iteration(operator, x.size(), steps=self.hparams.power_method_nb_step,momentum=self.hparams.power_method_error_momentum,
+                                               eps=self.hparams.power_method_error_threshold, verbose=True)
+        #FIXME??
+        #torch.set_grad_enabled(False)
+        return lambda_estimate
+
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
@@ -497,20 +630,30 @@ class GradMatch(pl.LightningModule):
             "--no_grad_matching", dest="grad_matching", action="store_false"
         )
         parser.set_defaults(grad_matching=True)
+        parser.add_argument("--grad_matching_bregman", dest="grad_matching_bregman", action="store_false")
+        parser.set_defaults(grad_matching_bregman=True)
         parser.add_argument("--weight_Dg", type=float, default=1.0)
         parser.add_argument(
             "--residual_learning", dest="residual_learning", action="store_true"
         )
         parser.set_defaults(residual_learning=False)
         parser.add_argument("--grayscale", dest="grayscale", action="store_true")
+        # added power iteration specific arguments
+        parser.add_argument('--power_method_nb_step', type=int, default=20)# was: 20
+        parser.add_argument('--power_method_error_threshold', type=float, default=1e-2)
+        parser.add_argument('--power_method_error_momentum', type=float, default=0.)
+        parser.add_argument('--power_method_mean_correction', dest='power_method_mean_correction', action='store_true')
+        #
         parser.set_defaults(grayscale=False)
+
         return parser
 
     @staticmethod
     def add_optim_specific_args(parent_parser):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
         parser.add_argument("--optimizer_type", type=str, default="adam")
-        parser.add_argument("--optimizer_lr", type=float, default=1e-4)
+        #FIXME? schedule?
+        parser.add_argument("--optimizer_lr", type=float, default=1e-5)
         parser.add_argument("--gradient_clip_val", type=float, default=1e-2)
         parser.add_argument("--scheduler_type", type=str, default="MultiStepLR")
         parser.add_argument(
@@ -542,6 +685,8 @@ class GradMatch(pl.LightningModule):
             "--use_sigma_model", dest="use_sigma_model", action="store_true"
         )
         parser.set_defaults(use_sigma_model=False)
+        parser.add_argument('--get_spectral_norm', dest='get_spectral_norm', action='store_true')
+        parser.set_defaults(get_spectral_norm=True)
         parser.add_argument("--sigma_model", type=int)
         parser.add_argument("--bregman_div_g", type=str, default="L2")
         parser.add_argument("--bregman_div_loss", type=str, default="L2")
@@ -560,4 +705,10 @@ class GradMatch(pl.LightningModule):
         parser.set_defaults(gaussian_noise_post=False)
         parser.add_argument("--max_sigma_gauss", type=float, default=7.65)
         parser.add_argument("--min_sigma_gauss", type=float, default=7.65)
+
+################## additional args for jacobian training
+        parser.add_argument('--jacobian_loss_weight', type=float, default=0)
+        parser.add_argument('--eps_jacobian_loss', type=float, default=0.1)
+        parser.add_argument('--jacobian_loss_type', type=str, default='max')
+
         return parser

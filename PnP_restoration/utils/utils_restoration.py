@@ -4,7 +4,41 @@ from scipy.fftpack import dct, idct
 import torch
 import cv2
 import os
+from skimage.metrics import structural_similarity as ssim_fun
+import lpips
 
+class Measures():
+    def __init__(self, net='alex', device='cuda'):
+        self.device = device
+        self.model = lpips.LPIPS(net=net).to(self.device)
+
+    def lpips(self, tensor1, tensor2):
+        tensor1 = tensor1.float().clamp_(0, 1)
+        tensor2 = tensor2.float().clamp_(0, 1)
+        tensor1_transf = tensor1 * 2 -1
+        tensor2_transf = tensor2 * 2 -1
+        lpips_score = self.model.forward(tensor1_transf, tensor2_transf)
+        lpips_score = lpips_score.item()
+        return lpips_score
+
+    def ssim(self ,tensor1, tensor2):
+        img1 = tensor2array(tensor1)
+        img2 = tensor2array(tensor2)
+        ssim_score = ssim_fun(img1, img2, channel_axis = 2, data_range=1.)
+        return ssim_score
+
+    def psnr(self, img1,img2) :
+        if not img1.shape == img2.shape:
+            raise ValueError('Input images must have the same dimensions.')
+        img1 = tensor2array(img1)
+        img2 = tensor2array(img2)
+        mse = np.mean((img1 - img2)**2)
+        return 20 * np.log10(1. / np.sqrt(mse))
+
+    def nrmse(self, tensor1, tensor_true):
+        array1 = tensor2array(tensor1)
+        array_true = tensor2array(tensor_true)
+        return np.linalg.norm((array1-array_true).ravel(),2)/np.linalg.norm(array_true.ravel(),2)
 
 def burg_bregman_divergence(x, y):
     x = x.reshape((x.shape[0], -1))
@@ -239,14 +273,32 @@ def rgb2y(im):
     return y
 
 
-def psnr(img1, img2):
-    if not img1.shape == img2.shape:
-        raise ValueError("Input images must have the same dimensions.")
-    # img1 = np.float64(img1)
-    # img2 = np.float64(img2)
-    mse = np.mean((img1 - img2) ** 2)
-    return 20 * np.log10(1.0 / np.sqrt(mse))
+# def psnr(img1, img2):
+#     if not img1.shape == img2.shape:
+#         raise ValueError("Input images must have the same dimensions.")
+#     # img1 = np.float64(img1)
+#     # img2 = np.float64(img2)
+#     mse = np.mean((img1 - img2) ** 2)
+#     return 20 * np.log10(1.0 / np.sqrt(mse))
 
+# def ssim(tensor1, tensor2):
+#     img1 = tensor2uint(tensor1)
+#     img2 = tensor2uint(tensor2)
+#     ssim_score = ssim_fun(img1, img2, channel_axis = 2)
+#     return ssim_score
+
+# device = "cuda:0"
+# loss_fn_vgg = LearnedPerceptualImagePatchSimilarity(net_type='squeeze').to(device)
+
+
+# def LPIPS(tensor1, tensor2, device):
+#     tensor1 = tensor1.data.squeeze().float().clamp_(0, 1)
+#     tensor2 = tensor2.data.squeeze().float().clamp_(0, 1)
+#     tensor1_transf = tensor1 * 2 -1
+#     tensor2_transf = tensor2 * 2 -1
+#     lpips_score = loss_fn_vgg(tensor1_transf, tensor2_transf)
+#     lpips_score = lpips_score.cpu().detach()[0][0][0][0]
+#     return lpips_score
 
 def psnr_torch(img1, img2):
     if not img1.shape == img2.shape:
